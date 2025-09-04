@@ -4,6 +4,10 @@ import time
 import uuid
 import asyncio
 import concurrent.futures
+import random
+import torch  # 用于GPU检测
+import numpy as np  # 新增：BM25依赖
+from rank_bm25 import BM25Okapi  # 新增：BM25关键词检索
 from typing import List, Dict, Any, Optional, Tuple
 from tqdm import tqdm
 import sys
@@ -13,20 +17,25 @@ from collections import defaultdict
 sys.path.append(os.path.dirname(__file__))
 from get_text_embedding import get_text_embedding
 
-# 确保依赖安装提示
+# 确保依赖安装提示（新增rank-bm25）
 required_packages = {
     "python-dotenv": "pip install python-dotenv",
     "openai": "pip install openai",
     "redis": "pip install redis",
     "pymilvus": "pip install pymilvus==2.4.3",  # Milvus Python SDK
-    "sentence-transformers": "pip install sentence-transformers",  # 轻量级重排序模型
-    "scikit-learn": "pip install scikit-learn"  # 兜底关键词检索用
+    "sentence-transformers": "pip install sentence-transformers",  # 备用重排序模型
+    "scikit-learn": "pip install scikit-learn",  # 兜底关键词检索用
+    "FlagEmbedding": "pip install FlagEmbedding",  # BGE重排模型依赖
+    "rank-bm25": "pip install rank-bm25"  # 新增：BM25关键词检索
 }
 for pkg, install_cmd in required_packages.items():
     try:
         __import__(pkg.replace("-", "_"))
     except ImportError:
         print(f"警告：未安装{pkg}，请执行命令：{install_cmd}")
+
+# 导入重排模型
+from FlagEmbedding import FlagReranker
 
 # 基础依赖导入
 try:
@@ -90,7 +99,7 @@ except ImportError:
 load_dotenv()
 
 
-# ===================== 1. 审计日志工具类（增强版本记录） =====================
+# ===================== 1. 审计日志工具类（增强重试机制） =====================
 class AuditLogManager:
     def __init__(self, redis_host: str = "localhost", redis_port: int = 6379, redis_db: int = 0):
         try:
@@ -154,8 +163,8 @@ class AuditLogManager:
             "status": status,
             "complete_time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "process_duration": round(time.time() - log_data["timestamp"], 3),
-            "embedding_model_version": model_version,  # 新增：记录嵌入模型版本
-            "retrieval_type": retrieval_type  # 新增：记录检索类型（vector/keyword_fallback）
+            "embedding_model_version": model_version,  # 记录嵌入模型版本
+            "retrieval_type": retrieval_type  # 记录检索类型（vector/keyword_fallback）
         })
 
         if self.using_redis:
@@ -164,29 +173,36 @@ class AuditLogManager:
             self.redis_client[f"audit_log:{log_id}"] = (log_data, time.time() + 86400)
         return True
 
-    async def write_audit_log_to_db(self, log_id: str) -> None:
-        try:
-            if self.using_redis:
-                log_str = self.redis_client.get(f"audit_log:{log_id}")
-                if not log_str:
-                    print(f"❌ 异步落盘失败：日志ID {log_id} 不存在")
-                    return
-                log_data = json.loads(log_str)
-            else:
-                log_entry = self.redis_client.get(f"audit_log:{log_id}")
-                if not log_entry or time.time() > log_entry[1]:
-                    print(f"❌ 异步落盘失败：日志ID {log_id} 不存在")
-                    return
-                log_data = log_entry[0]
+    async def write_audit_log_to_db(self, log_id: str, retries: int = 3) -> None:
+        """新增：异步落盘带重试机制"""
+        for attempt in range(retries):
+            try:
+                if self.using_redis:
+                    log_str = self.redis_client.get(f"audit_log:{log_id}")
+                    if not log_str:
+                        print(f"❌ 异步落盘失败：日志ID {log_id} 不存在")
+                        return
+                    log_data = json.loads(log_str)
+                else:
+                    log_entry = self.redis_client.get(f"audit_log:{log_id}")
+                    if not log_entry or time.time() > log_entry[1]:
+                        print(f"❌ 异步落盘失败：日志ID {log_id} 不存在")
+                        return
+                    log_data = log_entry[0]
 
-            print(f"📝 异步落盘日志 {log_id} 到数据库: {log_data['question'][:20]}...")
-            await asyncio.sleep(0.1)  # 模拟数据库延迟
-            if self.using_redis:
-                self.redis_client.delete(f"audit_log:{log_id}")
-        except Exception as e:
-            print(f"❌ 异步落盘日志失败: {str(e)}")
-            if self.using_redis:
-                self.redis_client.lpush("audit_log_failed", log_id)
+                print(f"📝 异步落盘日志 {log_id} 到数据库: {log_data['question'][:20]}...")
+                await asyncio.sleep(0.1)  # 模拟数据库延迟
+                if self.using_redis:
+                    self.redis_client.delete(f"audit_log:{log_id}")
+                break  # 成功则退出重试
+            except Exception as e:
+                if attempt < retries - 1:
+                    print(f"⚠️ 异步落盘尝试 {attempt+1} 失败，重试中: {str(e)}")
+                    await asyncio.sleep(1)  # 重试间隔1秒
+                else:
+                    print(f"❌ 异步落盘最终失败（{retries}次尝试）: {str(e)}")
+                    if self.using_redis:
+                        self.redis_client.lpush("audit_log_failed", log_id)
 
 
 # ===================== 2. Chunk处理工具（保留原有功能） =====================
@@ -233,23 +249,26 @@ def process_long_chunk(chunk: Dict[str, Any], max_tokens: int = 512, slide_step:
     return sub_chunks
 
 
-# ===================== 3. 向量库优化：MilvusVectorStore（增强版本绑定） =====================
+# ===================== 3. 向量库优化：MilvusVectorStore（增强缓存策略） =====================
 class MilvusVectorStore:
-    """
-    增强版Milvus向量库：支持模型版本绑定，解决回滚后版本不匹配问题
-    核心特性：
-    1. 每个向量附带embedding_model_version标签
-    2. 检索时支持按版本过滤
-    3. 提供版本兼容性检查接口
-    """
+    """增强版Milvus向量库：支持模型版本绑定和缓存优化"""
 
     def __init__(self, collection_name: str = "rag_finance_chunks", dim: int = 1536):
         self.collection_name = collection_name
         self.dim = dim
         self.collection = None
+        self.embedding_model_version = None  # 新增：缓存当前模型版本
         self._connect_milvus()
-        self._create_collection_with_version()  # 增强：创建含版本字段的集合
+        self._create_collection_with_version()  # 创建含版本字段的集合
         self._load_all_versions()  # 加载现有所有模型版本
+
+    def get_cache_key(self, query: str) -> str:
+        """新增：带模型版本的缓存键生成"""
+        return f"embedding:{self.embedding_model_version}:{hash(query)}"
+
+    def set_embedding_version(self, version: str) -> None:
+        """设置当前嵌入模型版本（用于缓存键）"""
+        self.embedding_model_version = version
 
     def _connect_milvus(self) -> None:
         if not MILVUS_AVAILABLE:
@@ -272,7 +291,7 @@ class MilvusVectorStore:
             self.in_memory_versions = []  # 内存模式下存储版本信息
 
     def _create_collection_with_version(self) -> None:
-        """增强：创建包含模型版本字段的集合"""
+        """创建包含模型版本字段的集合"""
         if not MILVUS_AVAILABLE or self.collection:
             return
         if not utility.has_collection(self.collection_name, using="default"):
@@ -282,7 +301,7 @@ class MilvusVectorStore:
                 FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=self.dim),
                 FieldSchema(name="content", dtype=DataType.VARCHAR, max_length=4096),
                 FieldSchema(name="metadata", dtype=DataType.JSON),
-                FieldSchema(name="embedding_model_version", dtype=DataType.VARCHAR, max_length=64)  # 新增：模型版本标签
+                FieldSchema(name="embedding_model_version", dtype=DataType.VARCHAR, max_length=64)  # 模型版本标签
             ]
             schema = CollectionSchema(fields=fields, description="RAG金融场景Chunk向量集合（带版本绑定）")
             self.collection = Collection(name=self.collection_name, schema=schema, using="default")
@@ -333,10 +352,7 @@ class MilvusVectorStore:
 
     def add_chunks_with_version(self, chunks: List[Dict[str, Any]], embeddings: List[List[float]],
                                 model_version: str) -> None:
-        """
-        增强：带模型版本的Chunk插入
-        :param model_version: 嵌入模型版本（如"bge-m3-v202405"）
-        """
+        """带模型版本的Chunk插入"""
         if not model_version:
             raise ValueError("模型版本不能为空，请指定有效的版本标识")
 
@@ -369,10 +385,7 @@ class MilvusVectorStore:
 
     def search_with_version(self, query_embedding: List[float], model_version: str,
                             top_k: int = 3, nprobe: int = 32) -> Tuple[List[Dict[str, Any]], bool]:
-        """
-        增强：按模型版本过滤的检索
-        :return: (检索结果, 版本匹配状态)
-        """
+        """按模型版本过滤的检索"""
         start_time = time.time()
         version_matched = True
 
@@ -471,22 +484,34 @@ class MilvusVectorStore:
         return sorted(self.available_versions)
 
 
-# ===================== 4. 兜底检索工具（新增：关键词检索+规则匹配） =====================
+# ===================== 4. 兜底检索工具（增强BM25融合） =====================
 class KeywordFallbackRetriever:
-    """
-    兜底检索器：当向量检索版本不匹配时，使用关键词检索+规则匹配确保返回结果
-    核心策略：
-    1. TF-IDF关键词相似度匹配
-    2. 数字/日期/专有名词优先匹配（针对金融场景优化）
-    3. 规则匹配（如"净利润"→优先匹配含"净利润"字段的Chunk）
-    """
+    """兜底检索器：结合TF-IDF和BM25，增强关键词密集型问题召回"""
 
     def __init__(self, all_chunks: List[Dict[str, Any]] = None):
         self.all_chunks = all_chunks or []
         self.tfidf_vectorizer = None
         self.chunk_vectors = None
+        self.bm25 = None  # 新增：BM25模型
+        self.bm25_tokenized_corpus = []  # 新增：BM25分词语料
         self._build_tfidf_index()  # 构建TF-IDF索引
+        self._build_bm25_index()  # 新增：构建BM25索引
         self._build_rule_map()  # 构建规则匹配映射
+
+    def _build_bm25_index(self) -> None:
+        """新增：构建BM25索引，优化关键词检索"""
+        if not self.all_chunks:
+            print("⚠️ BM25索引构建条件不足（缺少数据）")
+            return
+
+        try:
+            # 分词（简单空格分割，可替换为更复杂的分词器）
+            self.bm25_tokenized_corpus = [chunk["content"].split() for chunk in self.all_chunks]
+            self.bm25 = BM25Okapi(self.bm25_tokenized_corpus)
+            print(f"✅ BM25索引构建完成（{len(self.all_chunks)}个Chunk）")
+        except Exception as e:
+            print(f"⚠️ BM25索引构建失败：{str(e)}")
+            self.bm25 = None
 
     def _build_tfidf_index(self) -> None:
         """构建TF-IDF索引，用于关键词相似度匹配"""
@@ -525,24 +550,35 @@ class KeywordFallbackRetriever:
         print("✅ 规则匹配映射构建完成")
 
     def update_chunks(self, chunks: List[Dict[str, Any]]) -> None:
-        """更新Chunk数据并重建索引"""
+        """更新Chunk数据并重建所有索引"""
         self.all_chunks = chunks
         self._build_tfidf_index()
+        self._build_bm25_index()  # 新增：更新BM25索引
         self._build_rule_map()
 
+    def bm25_search(self, query: str, top_k: int = 20) -> List[Dict[str, Any]]:
+        """新增：BM25关键词检索"""
+        if not self.bm25 or not self.all_chunks:
+            return []
+        
+        tokenized_query = query.split()
+        scores = self.bm25.get_scores(tokenized_query)
+        top_indices = np.argsort(scores)[::-1][:top_k]
+        return [self.all_chunks[i] for i in top_indices]
+
     def retrieve(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
-        """
-        兜底检索执行
-        :return: 按匹配度排序的Chunk列表
-        """
+        """兜底检索执行：融合BM25+TF-IDF+规则"""
         start_time = time.time()
         if not self.all_chunks:
             print("❌ 兜底检索无可用Chunk数据")
             return []
 
-        # 步骤1：规则匹配（优先级最高）
+        # 步骤1：BM25检索（关键词密集型问题优先）
+        bm25_results = self.bm25_search(query, top_k=top_k*2)  # 取更多候选
+
+        # 步骤2：规则匹配（优先级最高）
         rule_matched = []
-        for chunk in self.all_chunks:
+        for chunk in bm25_results:  # 基于BM25结果再过滤
             match_score = 0
             # 检查是否匹配金融关键词规则
             for keyword, rule_func in self.rule_map.items():
@@ -557,7 +593,7 @@ class KeywordFallbackRetriever:
             if match_score > 0:
                 rule_matched.append((chunk, match_score))
 
-        # 步骤2：TF-IDF关键词相似度匹配（补充规则未匹配的结果）
+        # 步骤3：TF-IDF关键词相似度匹配（补充规则未匹配的结果）
         tfidf_matched = []
         if TFIDF_AVAILABLE and self.tfidf_vectorizer and self.chunk_vectors is not None:
             try:
@@ -573,8 +609,8 @@ class KeywordFallbackRetriever:
             except Exception as e:
                 print(f"⚠️ TF-IDF匹配失败：{str(e)}")
 
-        # 步骤3：综合排序（规则匹配 > TF-IDF > 随机）
-        all_candidates = rule_matched + tfidf_matched
+        # 步骤4：综合排序（规则匹配 > BM25 > TF-IDF > 随机）
+        all_candidates = rule_matched + [(c, 1.0) for c in bm25_results if c not in [rc[0] for rc in rule_matched]] + tfidf_matched
         # 若无匹配结果，返回任意top-k结果（避免空返回）
         if not all_candidates:
             all_candidates = [(chunk, 0.1) for chunk in self.all_chunks[:top_k]]
@@ -595,52 +631,7 @@ class KeywordFallbackRetriever:
         return final_results
 
 
-# ===================== 5. 重排序模型（保留原有功能） =====================
-class RerankModel:
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
-        self.model = None
-        try:
-            from sentence_transformers import SentenceTransformer, util
-            self.model = SentenceTransformer(model_name)
-            self.util = util
-            print(f"✅ 成功加载重排序模型：{model_name}")
-        except ImportError:
-            print("⚠️ 未安装sentence-transformers，重排序功能禁用（使用原始检索结果）")
-        except Exception as e:
-            print(f"⚠️ 重排序模型加载失败：{str(e)}，使用原始检索结果")
-
-    def preprocess(self, text: str) -> List[float]:
-        if not self.model:
-            return []
-        return self.model.encode(text, convert_to_tensor=False).tolist()
-
-    def rank(self, query_emb: List[float], candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        start_time = time.time()
-        if not self.model or not query_emb:
-            print("⚠️ 重排序功能未启用，返回原始检索结果")
-            return candidates
-
-        candidate_texts = [c["content"] for c in candidates]
-        candidate_embs = self.model.encode(candidate_texts, convert_to_tensor=False)
-        similarities = self.util.cos_sim(query_emb, candidate_embs)[0].tolist()
-
-        ranked_candidates = sorted(
-            zip(candidates, similarities),
-            key=lambda x: x[1],
-            reverse=True
-        )
-
-        results = [
-            {**cand, "rerank_similarity": round(sim, 4)}
-            for cand, sim in ranked_candidates
-        ]
-
-        rerank_duration = round((time.time() - start_time) * 1000, 2)
-        print(f"✅ 重排序完成（{len(candidates)}个候选），耗时：{rerank_duration}ms")
-        return results
-
-
-# ===================== 6. 流量分层路由工具（保留原有功能） =====================
+# ===================== 5. 流量分层路由工具（保留原有功能） =====================
 class LLMClientRouter:
     def __init__(self):
         self.local_config = {
@@ -707,15 +698,9 @@ class LLMClientRouter:
         return self.local_config["model"] if self._is_off_peak() else self.cloud_config["model"]
 
 
-# ===================== 7. 嵌入模型（增强版本管理） =====================
+# ===================== 6. 嵌入模型（增强版本管理） =====================
 class VersionedEmbeddingModel:
-    """
-    增强版嵌入模型：支持版本管理和回滚加载
-    核心特性：
-    1. 固定版本标识（如"bge-m3-v202405"）
-    2. 支持根据版本加载指定模型
-    3. 版本兼容性检查
-    """
+    """增强版嵌入模型：支持版本管理和回滚加载"""
 
     def __init__(self, batch_size: int = 64):
         # 从环境变量读取当前使用的模型版本和配置
@@ -733,10 +718,7 @@ class VersionedEmbeddingModel:
         print(f"✅ 嵌入模型初始化完成（版本：{self.current_version}，模型：{self.embedding_model}）")
 
     def _load_version_configs(self) -> Dict[str, Dict[str, str]]:
-        """
-        加载所有支持的模型版本配置
-        配置格式：版本→{api_key, base_url, model_name}
-        """
+        """加载所有支持的模型版本配置"""
         # 从环境变量加载多版本配置（支持多版本并存）
         version_configs = {}
         # 基础版本配置（默认）
@@ -778,10 +760,7 @@ class VersionedEmbeddingModel:
             raise ValueError(f"模型版本[{version}]配置不完整，缺少api_key或base_url")
 
     def switch_version(self, target_version: str) -> bool:
-        """
-        切换模型版本（用于回滚场景）
-        :return: 切换成功与否
-        """
+        """切换模型版本（用于回滚场景）"""
         if target_version == self.current_version:
             print(f"ℹ️ 当前已使用模型版本[{target_version}]，无需切换")
             return True
@@ -815,11 +794,11 @@ class VersionedEmbeddingModel:
         return self.embed_texts([text])[0]
 
 
-# ===================== 8. 核心RAG类（整合版本绑定与兜底机制） =====================
+# ===================== 7. 核心RAG类（整合多路召回） =====================
 class SimpleRAG:
     def __init__(self, chunk_json_path: str, batch_size: int = 32,
                  max_chunk_tokens: int = 512, slide_step: int = 200,
-                 milvus_dim: int = 1536, rerank_model_name: str = "all-MiniLM-L6-v2"):
+                 milvus_dim: int = 1536):
         self.enable_finance_mode = os.getenv('ENABLE_FINANCE_MODE', 'false').lower() == 'true'
         self.enable_fp8 = os.getenv('ENABLE_FP8_INFERENCE', 'false').lower() == 'true'
         self.max_chunk_tokens = max_chunk_tokens
@@ -845,14 +824,20 @@ class SimpleRAG:
             collection_name=os.getenv("MILVUS_COLLECTION", "rag_finance_chunks"),
             dim=milvus_dim
         )
+        self.vector_store.set_embedding_version(self.current_embedding_version)  # 同步版本到向量库
 
-        # 5. 初始化重排序模型
-        self.rerank_model = RerankModel(model_name=rerank_model_name)
+        # 5. 初始化BGE重排模型（核心新增）
+        self.reranker = FlagReranker(
+            'BAAI/bge-reranker-large',
+            use_fp16=True,
+            devices=["cuda:0"] if torch.cuda.is_available() else ["cpu"]
+        )
+        print("✅ BGE重排模型初始化完成")
 
         # 6. 初始化LLM流量路由
         self.llm_router = LLMClientRouter()
 
-        # 7. 初始化兜底检索器（核心新增）
+        # 7. 初始化兜底检索器（含BM25）
         self.fallback_retriever = KeywordFallbackRetriever()
 
         # 8. 金融模式扩展
@@ -881,7 +866,7 @@ class SimpleRAG:
             processed_chunks.extend(sub_chunks)
         print(f"   预处理后总Chunk数: {len(processed_chunks)}（含子Chunk）")
 
-        # 2. 更新兜底检索器的Chunk数据
+        # 2. 更新兜底检索器的Chunk数据（含BM25索引）
         self.fallback_retriever.update_chunks(processed_chunks)
 
         # 3. 生成向量嵌入（带版本）
@@ -903,45 +888,40 @@ class SimpleRAG:
         print(f"   - 向量库类型：{'Milvus' if MILVUS_AVAILABLE and self.vector_store.collection else '内存模式'}")
         print(
             f"   - 嵌入模型版本：{self.current_embedding_version}（支持版本：{self.embedding_model.get_available_versions()}）")
-        print(f"   - 重排序模型：{'启用' if self.rerank_model.model else '禁用'}")
-        print(f"   - 兜底检索：{'启用' if TFIDF_AVAILABLE else '禁用'}")
+        print(f"   - 重排序模型：BAAI/bge-reranker-large（{'GPU' if torch.cuda.is_available() else 'CPU'}模式）")
+        print(f"   - 兜底检索：{'启用' if TFIDF_AVAILABLE else '禁用'}（含BM25）")
         print(f"   - 金融模式：{'启用' if self.enable_finance_mode else '禁用'}")
         print("=" * 50)
 
     def switch_embedding_version(self, target_version: str) -> bool:
-        """
-        对外提供的版本切换接口（用于回滚场景）
-        :return: 切换成功与否
-        """
+        """对外提供的版本切换接口（用于回滚场景）"""
         # 切换嵌入模型版本
         embed_switch_ok = self.embedding_model.switch_version(target_version)
         if embed_switch_ok:
             self.current_embedding_version = target_version
+            self.vector_store.set_embedding_version(target_version)  # 同步更新向量库版本
             # 同步更新向量库的可用版本检查
             self.vector_store._load_all_versions()
             print(
                 f"✅ 版本切换完成，当前嵌入版本：{self.current_embedding_version}，向量库可用版本：{sorted(self.vector_store.available_versions)}")
         return embed_switch_ok
 
-    def query_with_fallback(self, question: str, top_k: int = 3, candidate_top_k: int = 20) -> Tuple[
+    def retrieve_and_rerank(self, query: str, top_k: int = 3, candidate_top_k: int = 20) -> Tuple[
         List[Dict[str, Any]], str, bool]:
-        """
-        增强：带兜底机制的检索
-        :return: (最终检索结果, 检索类型, 版本匹配状态)
-        """
+        """整合检索与重排的核心方法：向量+BM25多路召回"""
         start_total = time.time()
         print("\n" + "=" * 50)
-        print(f"开始处理查询：{question[:50]}...")
+        print(f"开始处理查询：{query[:50]}...")
 
         # 步骤1：生成查询向量（当前版本）
         print(f"1. 生成查询向量（版本：{self.current_embedding_version}）...")
         start_embed = time.time()
-        q_emb = self.embedding_model.embed_text(question)
+        q_emb = self.embedding_model.embed_text(query)
         embed_duration = round((time.time() - start_embed) * 1000, 2)
         print(f"   查询向量生成耗时：{embed_duration}ms")
 
-        # 步骤2：按版本检索向量（核心增强）
-        print(f"2. 按版本[{self.current_embedding_version}]执行向量检索...")
+        # 步骤2：向量检索（粗召回）
+        print(f"2. 按版本[{self.current_embedding_version}]执行向量检索（粗召回top-{candidate_top_k}）...")
         vector_results, version_matched = self.vector_store.search_with_version(
             query_embedding=q_emb,
             model_version=self.current_embedding_version,
@@ -949,40 +929,35 @@ class SimpleRAG:
             nprobe=32
         )
 
-        # 步骤3：检查是否需要触发兜底机制
-        retrieval_type = "vector"
-        final_candidates = vector_results
-        if not version_matched or len(vector_results) < top_k // 2:
-            # 版本不匹配或结果不足，触发兜底检索
-            print(f"⚠️ 向量检索结果不足（版本匹配：{version_matched}，结果数：{len(vector_results)}），触发兜底检索")
-            fallback_results = self.fallback_retriever.retrieve(question, top_k=top_k)
-            # 合并向量检索和兜底结果（去重，向量结果优先）
-            vector_ids = {res["id"] for res in vector_results}
-            combined_results = vector_results + [res for res in fallback_results if res["id"] not in vector_ids]
-            final_candidates = combined_results[:candidate_top_k]
-            retrieval_type = "vector+fallback" if vector_results else "fallback"
+        # 步骤3：BM25关键词检索（多路召回）
+        print(f"3. 执行BM25关键词检索（粗召回top-{candidate_top_k}）...")
+        bm25_results = self.fallback_retriever.bm25_search(query, top_k=candidate_top_k)
 
-        # 步骤4：并行执行重排序预处理（保留原有优化）
-        print("3. 执行重排序预处理...")
-        start_rerank_prep = time.time()
-        query_rerank_emb = self.rerank_model.preprocess(question)
-        rerank_prep_duration = round((time.time() - start_rerank_prep) * 1000, 2)
-        print(f"   重排序预处理耗时：{rerank_prep_duration}ms")
+        # 步骤4：融合向量和BM25结果（去重）
+        vector_ids = {res["id"] for res in vector_results}
+        combined_results = vector_results + [res for res in bm25_results if res["id"] not in vector_ids]
+        final_candidates = combined_results[:candidate_top_k]
+        retrieval_type = "vector+bm25"
 
-        # 步骤5：重排序
-        print("4. 候选结果重排序...")
-        ranked_chunks = self.rerank_model.rank(
-            query_emb=query_rerank_emb,
-            candidates=final_candidates
-        )
+        # 步骤5：BGE重排模型精排序
+        print(f"4. 使用BGE重排模型对{len(final_candidates)}个候选结果精排序...")
+        start_rerank = time.time()
+        # 构造（query, chunk内容）对
+        pairs = [(query, chunk["content"]) for chunk in final_candidates]
+        # 计算重排分数
+        scores = self.reranker.compute_score(pairs)
+        # 按分数排序并取top_k
+        reranked_chunks = [
+            chunk for _, chunk in sorted(zip(scores, final_candidates), key=lambda x: x[0], reverse=True)
+        ][:top_k]
+        rerank_duration = round((time.time() - start_rerank) * 1000, 2)
+        print(f"   重排完成，耗时：{rerank_duration}ms")
 
-        # 步骤6：取最终top-k结果
-        final_chunks = ranked_chunks[:top_k]
         total_duration = round((time.time() - start_total) * 1000, 2)
         print(f"✅ 查询完成（检索类型：{retrieval_type}，版本匹配：{version_matched}），总耗时：{total_duration}ms")
         print("=" * 50)
 
-        return final_chunks, retrieval_type, version_matched
+        return reranked_chunks, retrieval_type, version_matched
 
     def generate_answer(self, question: str, top_k: int = 3, user_id: Optional[str] = None) -> Dict[str, Any]:
         """生成回答（增强版本记录和兜底提示）"""
@@ -1000,8 +975,8 @@ class SimpleRAG:
         print(f"📌 生成审计日志ID: {log_id}")
 
         try:
-            # 2. 带兜底机制的检索（核心增强）
-            retrieved_chunks, retrieval_type, version_matched = self.query_with_fallback(
+            # 2. 使用新的检索+重排流程（核心修改）
+            retrieved_chunks, retrieval_type, version_matched = self.retrieve_and_rerank(
                 question, top_k=top_k, candidate_top_k=20
             )
 
@@ -1016,7 +991,7 @@ class SimpleRAG:
                         f"[文件名]{meta['file_name']} [页码]{meta.get('page', 'unknown')} "
                         f"[子Chunk {meta.get('sub_chunk_idx', 0)}/{meta.get('total_sub_chunks', 1)}] "
                         f"[检索类型:{chunk.get('retrieval_type', 'vector')}] "
-                        f"[相似度{chunk.get('rerank_similarity', chunk.get('similarity', 0)):.3f}]\n"
+                        f"[相似度{chunk.get('similarity', 0):.3f}]\n"
                         f"{chunk['content']}"
                     )
                     merged_context.append(sub_chunk_info)
@@ -1066,7 +1041,7 @@ class SimpleRAG:
                 request_kwargs["extra_body"] = {"precision": "fp8"}
                 print(f"   启用FP8精度推理（本地GPU模式）")
 
-            completion = llm_client.chat.completions.create(**request_kwargs)
+            completion = llm_client.chat.completions.create(** request_kwargs)
             llm_duration = round((time.time() - start_llm) * 1000, 2)
             print(f"   大模型推理耗时：{llm_duration}ms（{llm_meta['desc']}）")
 
@@ -1104,7 +1079,7 @@ class SimpleRAG:
                 model_version=self.current_embedding_version,
                 retrieval_type=retrieval_type
             )
-            asyncio.create_task(self.audit_logger.write_audit_log_to_db(log_id))
+            asyncio.create_task(self.audit_logger.write_audit_log_to_db(log_id))  # 带重试的异步落盘
 
             # 8. 返回最终结果（含版本和兜底信息）
             total_duration = sum([
@@ -1116,12 +1091,12 @@ class SimpleRAG:
                 "answer": answer,
                 "filename": filename,
                 "page": page,
-                "note": note,  # 新增：包含检索类型和版本信息
+                "note": note,  # 包含检索类型和版本信息
                 "retrieval_chunks": retrieved_chunks,
                 "merged_context": merged_context,
                 "audit_log_id": log_id,
                 "llm_route_info": llm_meta,
-                "version_info": {  # 新增：版本信息
+                "version_info": {  # 版本信息
                     "embedding_version": self.current_embedding_version,
                     "version_matched": version_matched,
                     "available_versions": sorted(self.vector_store.available_versions)
@@ -1145,7 +1120,7 @@ class SimpleRAG:
                 model_version=self.current_embedding_version,
                 retrieval_type="error"
             )
-            asyncio.create_task(self.audit_logger.write_audit_log_to_db(log_id))
+            asyncio.create_task(self.audit_logger.write_audit_log_to_db(log_id))  # 带重试的异步落盘
             return {
                 "question": question,
                 "answer": error_msg,
@@ -1165,7 +1140,7 @@ class SimpleRAG:
             }
 
 
-# ===================== 9. 原有辅助类（保留） =====================
+# ===================== 8. 原有辅助类（保留） =====================
 class PageChunkLoader:
     def __init__(self, json_path: str):
         self.json_path = json_path
@@ -1175,15 +1150,15 @@ class PageChunkLoader:
             return json.load(f)
 
 
-# ===================== 10. 主函数（测试版本回滚与兜底机制） =====================
+# ===================== 9. 主函数（启用全量测试数据） =====================
 if __name__ == '__main__':
     # 配置参数
     MAX_CHUNK_TOKENS = 512
     SLIDE_STEP = 200
     MILVUS_DIM = 1536
-    RERANK_MODEL = "all-MiniLM-L6-v2"
     TOP_K = 3
-    CANDIDATE_TOP_K = 20
+    CANDIDATE_TOP_K = 20  # 重排前的候选数量
+    TEST_SAMPLE_NUM = None  # 改为None运行全量测试数据
 
     # 初始化RAG系统
     chunk_json_path = os.path.join(os.path.dirname(__file__), 'all_pdf_page_chunks.json')
@@ -1191,8 +1166,7 @@ if __name__ == '__main__':
         chunk_json_path=chunk_json_path,
         max_chunk_tokens=MAX_CHUNK_TOKENS,
         slide_step=SLIDE_STEP,
-        milvus_dim=MILVUS_DIM,
-        rerank_model_name=RERANK_MODEL
+        milvus_dim=MILVUS_DIM
     )
     rag.setup()
 
@@ -1243,19 +1217,23 @@ if __name__ == '__main__':
     print(f"检索类型：{result3['note'].split('：')[1].split('，')[0]}")
     print(f"审计日志ID：{result3['audit_log_id']}")
 
-    # 批量测试（含版本统计）
-    TEST_SAMPLE_NUM = 5
+    # 批量测试（启用全量数据）
     FILL_UNANSWERED = True
     test_path = os.path.join(os.path.dirname(__file__), 'datas/多模态RAG图文问答挑战赛测试集.json')
     if os.path.exists(test_path):
         print("\n" + "=" * 60)
-        print(f"开始批量测试（{TEST_SAMPLE_NUM}条样本，含版本兼容性检查）...")
         with open(test_path, 'r', encoding='utf-8') as f:
             test_data = json.load(f)
-
-        all_indices = list(range(len(test_data)))
-        selected_indices = sorted(random.sample(all_indices, TEST_SAMPLE_NUM)) if len(
-            test_data) > TEST_SAMPLE_NUM else all_indices
+        
+        # 全量测试逻辑
+        if TEST_SAMPLE_NUM is None:
+            print(f"开始全量测试（共{len(test_data)}条样本）...")
+            selected_indices = list(range(len(test_data)))
+        else:
+            print(f"开始批量测试（{TEST_SAMPLE_NUM}条样本）...")
+            all_indices = list(range(len(test_data)))
+            selected_indices = sorted(random.sample(all_indices, TEST_SAMPLE_NUM)) if len(
+                test_data) > TEST_SAMPLE_NUM else all_indices
 
         results = []
         version_matched_count = 0

@@ -1,0 +1,20 @@
+# Core dependencies
+tqdm
+python-dotenv
+openai
+numpy
+loguru
+PyMuPDF
+
+# 需要高硬件资源
+# mineru[core]>=2.1.9
+# xinference>=1.8.0
+# 核心依赖
+pip install python-dotenv openai redis pymilvus==2.4.3 sentence-transformers
+
+# 可选：Milvus服务部署（参考官方文档：https://milvus.io/docs/install_standalone-docker.md）
+docker run -d --name milvus-standalone \
+  -p 19530:19530 \
+  -p 9091:9091 \
+  -e MILVUS_ROOT_PATH=/var/lib/milvus \
+  milvusdb/milvus:v2.4.3

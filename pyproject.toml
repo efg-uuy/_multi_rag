@@ -1,0 +1,24 @@
+[project]
+name = "spark-multi-rag"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mineru[core]>=2.1.9",
+    "xinference>=1.8.0",
+    "tqdm",
+    "python-dotenv",
+    "openai",
+    "numpy",
+    "loguru",
+    "PyMuPDF",
+    "notebook>=7.4.4",
+    "ipykernel>=6.30.0",
+    "pip>=25.2",
+    "unsloth>=2025.7.11",
+]
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true

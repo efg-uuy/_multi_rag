@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.pyo
+*.pyd
+*.pdb
+*.whl
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# macOS/Linux
+.DS_Store
+*.swp
+*.swo
+
+# Database/cache/output
+output/
+output/test/
+output/test/auto/
+caches/
+.embedding_cache/
+*.db
+*.db-shm
+*.db-wal
+
+# PDF/word/office
+*.pdf
+*.docx
+*.xlsx
+
+# Unsloth 缓存
+unsloth_compiled_cache/
+
+# JSON/数据文件
+all_pdf_page_chunks.json
+data_base_json_content/
+data_base_json_page_content/
+output/*.json
+*.json
+
+# 其他
+*.log
+*.tmp
+
+# 环境配置
+.env
+.env
+
+# 图片缓存
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+.venv/
+data_base_json_content/
+data_base_json_page_content/
+datas/
+
+# 模型训练输出目录
+model_train_outputs/
+
+spark_model_train_outputs

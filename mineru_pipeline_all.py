@@ -1,333 +1,312 @@
 import os
-import json
 import time
-import hashlib
-import uuid
-import asyncio
-import re
-from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
+import json
 from collections import defaultdict
-import torch
-import numpy as np
-from tqdm import tqdm
-from pymilvus import (
-    connections,
-    FieldSchema, CollectionSchema, DataType,
-    Collection,
-    utility
-)
-import redis
-from FlagEmbedding import FlagReranker
-from dotenv import load_dotenv
-from openai import OpenAI, RateLimitError
+import asyncio
+from dotenv import load_dotenv  # 新增：导入dotenv
+from image_utils.async_image_analysis import AsyncImageAnalysis
+# 新增：导入金融插件
+from finance_parser_plugin import fix_finance_cross_page_tables, analyze_finance_chart
 
-# 加载环境变量
+# 新增：加载环境变量
 load_dotenv()
 
 
-# ===================== 向量存储管理（含版本化缓存） =====================
-class MilvusVectorStore:
-    def __init__(self):
-        self.host = os.getenv("MILVUS_HOST", "localhost")
-        self.port = os.getenv("MILVUS_PORT", 19530)
-        self.collection_name = os.getenv("MILVUS_COLLECTION", "rag_finance_chunks")
-        self.dim = int(os.getenv("MILVUS_DIM", 1536))
-        self.model_version = os.getenv("EMBEDDING_MODEL_VERSION", "bge-m3-v202405")
-        self.redis_client = self._init_redis()
-        self._init_milvus()
-
-    def _init_redis(self):
-        """初始化Redis用于缓存预热和频率统计"""
-        try:
-            r = redis.Redis(
-                host=os.getenv("REDIS_HOST", "localhost"),
-                port=int(os.getenv("REDIS_PORT", 6379)),
-                db=int(os.getenv("REDIS_DB", 0)),
-                decode_responses=True
-            )
-            r.ping()
-            return r
-        except Exception as e:
-            print(f"Redis初始化失败，使用内存缓存: {e}")
-            return defaultdict(int)  # 内存模拟
-
-    def _init_milvus(self):
-        """初始化Milvus集合，添加版本化字段"""
-        connections.connect(host=self.host, port=self.port)
-
-        if not utility.has_collection(self.collection_name):
-            fields = [
-                FieldSchema(name="id", dtype=DataType.VARCHAR, max_length=64, is_primary=True),
-                FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=self.dim),
-                FieldSchema(name="model_version", dtype=DataType.VARCHAR, max_length=64),
-                FieldSchema(name="pdf_hash", dtype=DataType.VARCHAR, max_length=64),
-                FieldSchema(name="content", dtype=DataType.TEXT),
-                FieldSchema(name="metadata", dtype=DataType.JSON),
-                FieldSchema(name="last_access", dtype=DataType.INT64)  # 用于缓存预热
-            ]
-            schema = CollectionSchema(fields, description="Versioned RAG chunks with PDF hash")
-            Collection(self.collection_name, schema)
-
-            # 创建索引
-            collection = Collection(self.collection_name)
-            index_params = {
-                "index_type": "IVF_FLAT",
-                "metric_type": "L2",
-                "params": {"nlist": 1024}
-            }
-            collection.create_index("embedding", index_params)
-        self.collection = Collection(self.collection_name)
-        self.collection.load()
-
-    def add_chunks_with_version(self, chunks: List[Dict], embeddings: List[List[float]]):
-        """添加带版本和哈希的文档块"""
-        entities = []
-        for chunk, emb in zip(chunks, embeddings):
-            # 计算PDF内容哈希
-            pdf_path = chunk["metadata"].get("file_path")
-            pdf_hash = self._compute_pdf_hash(pdf_path) if pdf_path else "unknown"
-
-            # 更新访问时间（用于缓存预热）
-            current_ts = int(time.time())
-
-            entities.append({
-                "id": chunk.get("id", str(uuid.uuid4())),
-                "embedding": emb,
-                "model_version": self.model_version,
-                "pdf_hash": pdf_hash,
-                "content": chunk["content"],
-                "metadata": chunk["metadata"],
-                "last_access": current_ts
-            })
-
-        if entities:
-            self.collection.insert(entities)
-            self.collection.flush()
-            # 更新Redis访问频率
-            for entity in entities:
-                self.redis_client.incr(f"pdf_freq:{entity['pdf_hash']}")
-
-    def _compute_pdf_hash(self, pdf_path: str) -> str:
-        """计算PDF内容的SHA-256哈希"""
-        if not pdf_path or not os.path.exists(pdf_path):
-            return "invalid_path"
+def parse_all_pdfs(datas_dir, output_base_dir):
+    """
+    步骤1：解析所有PDF，输出内容到 data_base_json_content/
+    """
+    from mineru_parse_pdf import do_parse
+    datas_dir = Path(datas_dir)
+    output_base_dir = Path(output_base_dir)
+    pdf_files = list(datas_dir.rglob('*.pdf'))
+    if not pdf_files:
+        print(f"未找到PDF文件于: {datas_dir}")
+        return
+    for pdf_path in pdf_files:
+        file_name = pdf_path.stem
         with open(pdf_path, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()
-
-    def invalidate_cache(self, pdf_hash: str):
-        """主动失效指定PDF的缓存"""
-        expr = f"pdf_hash == '{pdf_hash}'"
-        self.collection.delete(expr)
-        print(f"已删除PDF哈希为 {pdf_hash} 的缓存")
-        # 清除Redis频率记录
-        self.redis_client.delete(f"pdf_freq:{pdf_hash}")
-
-    def cache_warmup(self, top_n: int = 10):
-        """预热高频访问的PDF向量"""
-        if isinstance(self.redis_client, redis.Redis):
-            # 获取访问频率Top N的PDF哈希
-            freq_dict = {k: int(v) for k, v in self.redis_client.hgetall("pdf_freq").items()}
-            top_hashes = [k for k, _ in sorted(freq_dict.items(), key=lambda x: x[1], reverse=True)[:top_n]]
-
-            for pdf_hash in top_hashes:
-                expr = f"pdf_hash == '{pdf_hash}' && model_version == '{self.model_version}'"
-                self.collection.query(expr, output_fields=["id", "embedding"])
-                print(f"预热缓存: {pdf_hash}")
-        else:
-            print("使用内存缓存，跳过预热")
-
-    def search(self, query_emb: List[float], limit: int = 5) -> List[Dict]:
-        """检索符合当前模型版本的向量"""
-        expr = f"model_version == '{self.model_version}'"
-        search_params = {"metric_type": "L2", "params": {"nprobe": 10}}
-        results = self.collection.search(
-            data=[query_emb],
-            anns_field="embedding",
-            param=search_params,
-            limit=limit,
-            expr=expr,
-            output_fields=["content", "metadata", "pdf_hash"]
+            pdf_bytes = f.read()
+        output_dir = output_base_dir / file_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+        do_parse(
+            output_dir=str(output_dir),
+            pdf_file_names=[file_name],
+            pdf_bytes_list=[pdf_bytes],
+            p_lang_list=["ch"],
+            backend="pipeline",
+            f_draw_layout_bbox=False,
+            f_draw_span_bbox=False,
+            f_dump_md=False,
+            f_dump_middle_json=False,
+            f_dump_model_output=False,
+            f_dump_orig_pdf=False,
+            f_dump_content_list=True
         )
-
-        # 更新访问时间
-        hit_ids = [hit.id for hit in results[0]]
-        if hit_ids:
-            self.collection.update(
-                expr=f"id in {hit_ids}",
-                entities={"last_access": int(time.time())}
-            )
-
-        return [{"content": hit.entity.get("content"),
-                 "metadata": hit.entity.get("metadata"),
-                 "distance": hit.distance}
-                for hit in results[0]]
+        print(f"已输出: {output_dir / 'auto' / (file_name + '_content_list.json')}")
 
 
-# ===================== 嵌入向量获取 =====================
-class EmbeddingClient:
-    def __init__(self):
-        self.api_key = os.getenv("LOCAL_API_KEY")
-        self.base_url = os.getenv("LOCAL_BASE_URL")
-        self.model = os.getenv("LOCAL_EMBEDDING_MODEL", "BAAI/bge-m3-finance")
-        self.client = self._get_client()
+def group_by_page(content_list):
+    pages = defaultdict(list)
+    for item in content_list:
+        page_idx = item.get('page_idx', 0)
+        pages[page_idx].append(item)
+    return dict(pages)
 
-    def _get_client(self) -> OpenAI:
-        if not self.api_key or not self.base_url:
-            raise ValueError("请配置LOCAL_API_KEY和LOCAL_BASE_URL")
-        return OpenAI(api_key=self.api_key, base_url=self.base_url)
 
-    def get_embeddings(self, texts: List[str], batch_size: int = 64) -> List[List[float]]:
-        """批量获取文本嵌入，带重试机制"""
-        all_embeddings = []
-        for i in tqdm(range(0, len(texts), batch_size), desc="生成嵌入向量"):
-            batch = texts[i:i + batch_size]
-            retry_count = 0
-            while retry_count < 3:
+def build_element_relation(page_elements: list) -> list:
+    """
+    为表格/图片添加相邻文本关联信息
+    :param page_elements: 单页包含的所有元素列表（文本、表格、图片）
+    :return: 处理后的元素列表
+    """
+    for i, elem in enumerate(page_elements):
+        # 仅处理表格和图片
+        if elem["type"] not in ["table", "image"]:
+            continue
+        
+        # 查找前一个文本元素（标题或段落）
+        prev_text = ""
+        for j in range(i-1, -1, -1):
+            if page_elements[j]["type"] == "text":
+                prev_text = page_elements[j].get("text", "")[:50]  # 取前50字作为摘要
+                break
+        
+        # 查找后一个文本元素
+        next_text = ""
+        for j in range(i+1, len(page_elements)):
+            if page_elements[j]["type"] == "text":
+                next_text = page_elements[j].get("text", "")[:50]
+                break
+        
+        # 添加关联信息
+        elem["related_context"] = {
+            "prev_text": prev_text,
+            "next_text": next_text,
+            "position": f"第{i+1}个元素"  # 元素在页面中的位置索引
+        }
+    return page_elements
+
+
+def item_to_markdown(item, enable_image_caption=True):
+    """
+    enable_image_caption: 是否启用多模态视觉分析（图片caption补全），默认True。
+    """
+    # 默认API参数：硅基流动Qwen/Qwen2.5-VL-32B-Instruct
+    vision_provider = "guiji"
+    vision_model = "Pro/Qwen/Qwen2.5-VL-7B-Instruct"
+    vision_api_key = os.getenv("LOCAL_API_KEY")
+    vision_base_url = os.getenv("LOCAL_BASE_URL")
+
+    if item['type'] == 'text':
+        level = item.get('text_level', 0)
+        text = item.get('text', '')
+        if level == 1:
+            return f"# {text}\n\n"
+        elif level == 2:
+            return f"## {text}\n\n"
+        else:
+            return f"{text}\n\n"
+    elif item['type'] == 'image':
+        captions = item.get('image_caption', [])
+        caption = captions[0] if captions else ''
+        img_path = item.get('img_path', '')
+        # 如果没有caption，且允许视觉分析，调用多模态API补全
+        if enable_image_caption and not caption and img_path and os.path.exists(img_path):
+            max_retries = 3
+            retry_delay = 2  # 秒
+            for attempt in range(max_retries):
                 try:
-                    response = self.client.embeddings.create(model=self.model, input=batch)
-                    all_embeddings.extend([e.embedding for e in response.data])
-                    break
-                except RateLimitError:
-                    time.sleep(2 ** retry_count)  # 指数退避
-                    retry_count += 1
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+
+                    async def get_caption():
+                        async with AsyncImageAnalysis(
+                                provider=vision_provider,
+                                api_key=vision_api_key,
+                                base_url=vision_base_url,
+                                vision_model=vision_model
+                        ) as analyzer:
+                            result = await analyzer.analyze_image(local_image_path=img_path)
+                            return result.get('title') or result.get('description') or ''
+
+                    caption = loop.run_until_complete(get_caption())
+                    loop.close()
+                    if caption:
+                        item['image_caption'] = [caption]
+                    break  # 成功则退出重试
                 except Exception as e:
-                    raise RuntimeError(f"嵌入生成失败: {e}")
-        return all_embeddings
+                    print(f"图片解释失败（尝试{attempt+1}/{max_retries}）: {img_path}, {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+        md = f"![{caption}]({img_path})\n"
+        return md + "\n"
+    elif item['type'] == 'table':
+        captions = item.get('table_caption', [])
+        caption = captions[0] if captions else ''
+        table_html = item.get('table_body', '')
+        img_path = item.get('img_path', '')
+        md = ''
+        if caption:
+            md += f"**{caption}**\n"
+        if img_path:
+            md += f"![{caption}]({img_path})\n"
+        md += f"{table_html}\n\n"
+        return md
+    else:
+        return '\n'
 
 
-# ===================== RAG核心逻辑 =====================
-class SimpleRAG:
-    def __init__(self):
-        self.vector_store = MilvusVectorStore()
-        self.embedding_client = EmbeddingClient()
-        self.reranker = FlagReranker('BAAI/bge-reranker-v2-m3', use_fp16=True)
-        self.llm = self._init_llm()
-        self.vector_store.cache_warmup()  # 启动时预热缓存
+def assemble_pages_to_markdown(pages, pdf_path):
+    # 强制启用金融模式
+    enable_finance_mode = os.getenv('ENABLE_FINANCE_MODE', 'true').lower() == 'true'
 
-    def _init_llm(self) -> OpenAI:
-        """初始化LLM客户端"""
-        return OpenAI(
-            api_key=os.getenv("LOCAL_LLM_API_KEY"),
-            base_url=os.getenv("LOCAL_LLM_BASE_URL", "http://localhost:8000/v1")
-        )
+    page_md = {}
+    for page_idx in sorted(pages.keys()):
+        # 处理金融表格（如果启用）
+        if enable_finance_mode:
+            # 提取当前页的表格并修复跨页表格
+            tables = [item for item in pages[page_idx] if item['type'] == 'table']
+            if tables:
+                fixed_tables = fix_finance_cross_page_tables(tables, page_idx, pdf_path)
+                # 更新页面中的表格数据
+                table_idx = 0
+                for i, item in enumerate(pages[page_idx]):
+                    if item['type'] == 'table' and table_idx < len(fixed_tables):
+                        pages[page_idx][i] = fixed_tables[table_idx]
+                        table_idx += 1
 
-    def process_chunks(self, chunk_path: str = "all_pdf_page_chunks.json"):
-        """处理文档块并添加到向量库"""
-        with open(chunk_path, 'r', encoding='utf-8') as f:
-            chunks = json.load(f)
+        # 处理金融图表分析（如果启用）
+        if enable_finance_mode:
+            images = [item for item in pages[page_idx] if item['type'] == 'image']
+            if images:
+                chart_analyzer = AsyncImageAnalysis(provider="zhipu")
+                analyzed_images = [analyze_finance_chart(img, chart_analyzer) for img in images]
+                # 更新页面中的图表数据
+                img_idx = 0
+                for i, item in enumerate(pages[page_idx]):
+                    if item['type'] == 'image' and img_idx < len(analyzed_images):
+                        pages[page_idx][i] = analyzed_images[img_idx]
+                        img_idx += 1
 
-        # 生成嵌入向量
-        texts = [chunk["content"] for chunk in chunks]
-        embeddings = self.embedding_client.get_embeddings(texts)
+        # 生成当前页的Markdown内容
+        md = ''
+        for item in pages[page_idx]:
+            md += item_to_markdown(item, enable_image_caption=True)
+        page_md[page_idx] = md
 
-        # 添加到向量库（带版本和哈希）
-        self.vector_store.add_chunks_with_version(chunks, embeddings)
-        print(f"已处理 {len(chunks)} 个文档块")
-
-    def retrieve(self, query: str, top_k: int = 8) -> List[Dict]:
-        """检索相关文档块并重新排序"""
-        # 生成查询嵌入
-        query_emb = self.embedding_client.get_embeddings([query])[0]
-
-        # 向量检索
-        candidates = self.vector_store.search(query_emb, limit=top_k * 2)
-
-        # 重排序
-        pairs = [(query, c["content"]) for c in candidates]
-        scores = self.reranker.compute_score(pairs)
-        scored_candidates = [c for _, c in sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)]
-
-        return scored_candidates[:top_k]
-
-    def generate_answer_with_source(self, context_chunks: List[Dict], question: str) -> str:
-        """生成带标准化来源的答案"""
-        if not context_chunks:
-            return f"未找到相关信息回答问题：{question}\n来源：无"
-
-        # 格式化来源信息
-        sources = []
-        for chunk in context_chunks:
-            meta = chunk["metadata"]
-            file_name = meta.get("file_name", "未知文件")
-            start_page = meta.get("start_page", 0) + 1  # 转换为1基页码
-            end_page = meta.get("end_page", 0) + 1
-
-            page_str = f"P{start_page}" if start_page == end_page else f"P{start_page}-{end_page}"
-            sources.append(f"{file_name}（{page_str}）")
-
-        unique_sources = sorted(set(sources))
-        source_str = "; ".join(unique_sources)
-
-        # 构建提示词
-        prompt = f"""
-        基于以下参考内容回答问题，答案末尾必须以「来源：xxx」格式标注所有参考文档。
-        要求：
-        1. 来源必须完全匹配提供的可用来源列表，不得虚构
-        2. 来源格式严格为「文件名（P页码）」或「文件名（P页码-页码）」
-        3. 答案简洁准确，与问题强相关
-
-        参考内容：
-        {[c['content'][:500] for c in context_chunks]}  # 限制长度避免超限
-
-        用户问题：{question}
-        可用来源列表：{source_str}
-
-        回答示例：
-        2023年公司营收为120.5亿元，同比增长15.2%。
-        来源：2023年报.pdf（P5）; 季度财报Q4.pdf（P2-3）
-        """
-
-        # 调用LLM
-        try:
-            response = self.llm.chat.completions.create(
-                model=os.getenv("LOCAL_LLM_MODEL", "qwen2.5-7b-instruct"),
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=1024
-            )
-            answer = response.choices[0].message.content.strip()
-        except Exception as e:
-            answer = f"生成答案失败：{str(e)}"
-
-        # 校验并修复来源格式
-        if "来源：" not in answer:
-            answer += f"\n来源：{source_str}"
-        else:
-            if not re.search(r"来源：.*（P\d+(-\d+)?）", answer):
-                answer = answer.split("来源：")[0].strip() + f"\n来源：{source_str}"
-
-        return answer
-
-    def pipeline(self, query: str) -> str:
-        """完整RAG流程：检索→生成答案"""
-        context = self.retrieve(query)
-        return self.generate_answer_with_source(context, query)
+    return page_md
 
 
-# ===================== 缓存失效工具（用于PDF更新时） =====================
-def handle_updated_pdf(pdf_path: str, vector_store: MilvusVectorStore):
-    """处理更新后的PDF，失效旧缓存并重新解析"""
-    pdf_hash = vector_store._compute_pdf_hash(pdf_path)
-    vector_store.invalidate_cache(pdf_hash)
+def process_all_pdfs_to_page_json(input_base_dir, output_base_dir):
+    """
+    步骤2：将content_list.json按页组织，生成page_content.json（含Markdown内容）
+    """
+    input_base_dir = Path(input_base_dir)
+    output_base_dir = Path(output_base_dir)
+    output_base_dir.mkdir(parents=True, exist_ok=True)
 
-    # 触发重新解析（实际项目中应调用mineru_pipeline_all.py中的解析逻辑）
-    print(f"PDF {pdf_path} 已更新，旧缓存已清除，建议重新运行解析流程")
+    pdf_dirs = [d for d in input_base_dir.iterdir() if d.is_dir()]
+    if not pdf_dirs:
+        print(f"⚠️  未在 {input_base_dir} 找到PDF解析目录")
+        return
+
+    for pdf_dir in pdf_dirs:
+        file_name = pdf_dir.name
+        pdf_file_name = f"{file_name}.pdf"
+
+        # 定位content_list.json
+        content_list_path = pdf_dir / 'auto' / f'{file_name}_content_list.json'
+        if not content_list_path.exists():
+            content_list_path = pdf_dir / file_name / 'auto' / f'{file_name}_content_list.json'
+        if not content_list_path.exists():
+            print(f"❌ 未找到 {file_name} 的content_list.json，跳过")
+            continue
+
+        # 读取并处理content_list
+        with open(content_list_path, 'r', encoding='utf-8') as f:
+            content_list = json.load(f)
+        
+        # 按页分组
+        pages = group_by_page(content_list)
+        
+        # 新增：为每一页的元素添加关联信息
+        for page_idx in pages:
+            pages[page_idx] = build_element_relation(pages[page_idx])
+        
+        # 生成每页Markdown
+        page_md = assemble_pages_to_markdown(pages, pdf_file_name)
+
+        # 输出page_content.json（包含关联信息）
+        output_dir = output_base_dir / file_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_json_path = output_dir / f'{file_name}_page_content.json'
+        with open(output_json_path, 'w', encoding='utf-8') as f:
+            json.dump(page_md, f, ensure_ascii=False, indent=2)
+
+        print(f"✅ 页面内容生成完成: {output_json_path}")
 
 
-# ===================== 测试代码 =====================
-if __name__ == "__main__":
-    # 初始化RAG
-    rag = SimpleRAG()
-
-    # 可选：处理文档块（首次运行时需要）
-    # rag.process_chunks()
-
-    # 测试查询
-    test_query = "2023年公司营收是多少？"
-    print("查询:", test_query)
-    result = rag.pipeline(test_query)
-    print("回答:\n", result)
-
-    # 示例：处理更新的PDF（实际使用时调用）
-    # handle_updated_pdf("datas/2023年报.pdf", rag.vector_store)
+def process_page_content_to_chunks(input_base_dir, output_json_path):
+    """
+    步骤3：将 page_content.json 合并为 all_pdf_page_chunks.json，包含logical_pages信息
+    """
+    input_base_dir = Path(input_base_dir)
+    all_chunks = []
+    for pdf_dir in input_base_dir.iterdir():
+        if not pdf_dir.is_dir():
+            continue
+        file_name = pdf_dir.name
+        # 查找中间JSON文件，获取logical_pages信息
+        middle_json_path = pdf_dir / f"{file_name}_middle.json"
+        if not middle_json_path.exists():
+            sub_dir = pdf_dir / file_name
+            middle_json_path2 = sub_dir / f"{file_name}_middle.json"
+            if middle_json_path2.exists():
+                middle_json_path = middle_json_path2
+            else:
+                print(f"未找到中间JSON: {middle_json_path}")
+                continue
+                
+        # 读取logical_pages信息
+        with open(middle_json_path, 'r', encoding='utf-8') as f:
+            middle_json = json.load(f)
+        logical_pages = middle_json.get("logical_pages", [])
+        
+        # 处理页面内容
+        page_content_path = pdf_dir / f"{file_name}_page_content.json"
+        if not page_content_path.exists():
+            sub_dir = pdf_dir / file_name
+            page_content_path2 = sub_dir / f"{file_name}_page_content.json"
+            if page_content_path2.exists():
+                page_content_path = page_content_path2
+            else:
+                print(f"未找到: {page_content_path}")
+                continue
+                
+        with open(page_content_path, 'r', encoding='utf-8') as f:
+            page_dict = json.load(f)
+            
+        # 关联logical_pages和page内容
+        logical_page_map = {str(lp["physical_page"]): lp for lp in logical_pages}
+        for page_idx, content in page_dict.items():
+            logical_page = logical_page_map.get(page_idx, {})
+            chunk = {
+                "id": logical_page.get("logical_id", f"{file_name}_page_{page_idx}"),
+                "content": content,
+                "metadata": {
+                    "page": page_idx,
+                    "file_name": file_name + ".pdf",
+                    "logical_id": logical_page.get("logical_id"),
+                    "para_simhashes": logical_page.get("para_simhashes", []),
+                    # 提取块类型信息
+                    "block_types": [b["type"] for b in middle_json["pdf_info"]["pages"][int(page_idx)]["blocks"] 
+                                   if "type" in b]
+                }
+            }
+            all_chunks.append(chunk)
+    
+    with open(output_json_path, 'w', encoding='utf-8') as f:
+        json.dump(all_chunks, f, ensure_ascii=False, indent=2)
+    print(f"已输出: {output_json_path}")

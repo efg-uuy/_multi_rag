@@ -1,515 +1,320 @@
-# Copyright (c) Opendatalab. All rights reserved.
-import copy
-import json
-import os
-from pathlib import Path
-import hashlib
-from simhash import Simhash
+# ===================== 基于章节边界的分块逻辑与检索工具 =====================
+import re
+import time
+from typing import List, Dict, Any, Optional
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from rank_bm25 import BM25Okapi  # 需确保安装rank-bm25
 
-from loguru import logger
-
-# 新增：CLIP相关导入
+# 检查TF-IDF依赖是否可用
 try:
-    import torch
-    import clip
-    from PIL import Image
-    from torch.nn.functional import cosine_similarity
+    from sklearn.feature_extraction.text import TfidfVectorizer
 
-    CLIP_AVAILABLE = True
+    TFIDF_AVAILABLE = True
 except ImportError:
-    CLIP_AVAILABLE = False
-
-from mineru.cli.common import convert_pdf_bytes_to_bytes_by_pypdfium2, prepare_env, read_fn
-from mineru.data.data_reader_writer import FileBasedDataWriter
-from mineru.utils.draw_bbox import draw_layout_bbox, draw_span_bbox
-from mineru.utils.enum_class import MakeMode
-from mineru.backend.vlm.vlm_analyze import doc_analyze as vlm_doc_analyze
-from mineru.backend.pipeline.pipeline_analyze import doc_analyze as pipeline_doc_analyze
-from mineru.backend.pipeline.pipeline_middle_json_mkcontent import union_make as pipeline_union_make
-from mineru.backend.pipeline.model_json_to_middle_json import result_to_middle_json as pipeline_result_to_middle_json
-from mineru.backend.vlm.vlm_middle_json_mkcontent import union_make as vlm_union_make
-from mineru.utils.models_download_utils import auto_download_and_get_model_root_path
-
-os.environ['MINERU_MODEL_SOURCE'] = "modelscope"
+    TFIDF_AVAILABLE = False
 
 
-# ===================== 新增：段落级Simhash生成 =====================
-def paragraph_simhash(content, window_size=3):
-    """生成段落级Simhash特征，降低排版变动影响"""
-    paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
-    return [Simhash(p).value for p in paragraphs[:window_size]]  # 取前N段特征
+# ===================== 新增：滑动窗口分割函数 =====================
+def slide_window_split(text: str, max_tokens: int, slide_step: int) -> List[str]:
+    """使用滑动窗口分割超长文本"""
+    tokens = text.split()
+    sub_paras = []
+    start = 0
+    while start < len(tokens):
+        end = min(start + max_tokens, len(tokens))
+        sub_para = ' '.join(tokens[start:end])
+        sub_paras.append(sub_para)
+        # 防止步长为0导致死循环
+        start += slide_step if slide_step > 0 else max_tokens
+    return sub_paras
 
 
-# ===================== 新增：语义块生成（基于文档结构） =====================
-def generate_semantic_chunks(middle_json):
+# ===================== 新增：基于章节逻辑的分块函数 =====================
+def process_chunks_by_logical_structure(
+        logical_pages: List[Dict[str, Any]],
+        max_tokens: int = 512,
+        slide_step: int = 200
+) -> List[Dict[str, Any]]:
     """
-    基于文档语义层级生成结构化语义块
-    以一级标题为单元，打包其下的段落、表格和图像
+    基于文档逻辑结构（章节、段落）进行分块，保留表格和图表的完整性
+    优先以logical_pages（章节）为单位，超长章节内部再细分
     """
-    semantic_chunks = []
-    current_chunk = {
-        "chunk_id": "",
-        "title": "",
-        "content": [],
-        "images": [],
-        "tables": [],
-        "start_page": None,
-        "end_page": None,
-        "para_simhashes": []
-    }
+    processed_chunks = []
 
-    for page in middle_json["pdf_info"]["pages"]:
-        page_idx = page["page_idx"]
+    for page in logical_pages:
+        # 提取章节级内容与元数据
+        content = page["content"].strip()
+        metadata = {
+            "logical_id": page["logical_id"],  # 章节唯一标识
+            "physical_page": page["physical_page"],  # 原始物理页码
+            "para_simhashes": page["para_simhashes"],  # 段落特征值
+            "block_types": page.get("block_types", [])  # 块类型（表格/图片等）
+        }
 
-        for block in page["blocks"]:
-            # 一级标题作为新块的起点
-            if block["type"] == "heading" and block.get("level") == 1:
-                # 保存当前块（如果有内容）
-                if current_chunk["content"] or current_chunk["images"] or current_chunk["tables"]:
-                    # 生成chunk_id
-                    title_hash = hashlib.md5(current_chunk["title"].encode()).hexdigest()
-                    current_chunk["chunk_id"] = f"chunk_{title_hash}_{current_chunk['start_page']}"
-                    # 生成段落Simhash
-                    full_content = "\n\n".join(current_chunk["content"])
-                    current_chunk["para_simhashes"] = paragraph_simhash(full_content)
-                    semantic_chunks.append(current_chunk)
+        # 为特殊元素添加标记（提升检索精度）
+        if "table" in metadata["block_types"]:
+            content = f"[TABLE]\n{content}\n[/TABLE]"
+        if "image" in metadata["block_types"] or "figure" in metadata["block_types"]:
+            content = f"[CHART]\n{content}\n[/CHART]"
 
-                # 初始化新块
-                current_chunk = {
-                    "chunk_id": "",
-                    "title": block["content"],
-                    "content": [],
-                    "images": [],
-                    "tables": [],
-                    "start_page": page_idx,
-                    "end_page": page_idx,
-                    "para_simhashes": []
-                }
+        # 按空行分割段落（保留段落逻辑）
+        paragraphs = re.split(r'\n\s*\n', content)
+        paragraphs = [p.strip() for p in paragraphs if p.strip()]  # 过滤空段落
 
-            # 其他类型内容添加到当前块
+        current_chunk = []
+        current_length = 0
+
+        for para in paragraphs:
+            para_tokens = para.split()
+            para_length = len(para_tokens)
+
+            # 处理超长段落（单个段落超过最大长度）
+            if para_length > max_tokens:
+                if current_chunk:
+                    # 先保存当前累积的合法块
+                    processed_chunks.append({
+                        "content": '\n\n'.join(current_chunk),
+                        "metadata": metadata.copy()
+                    })
+                    current_chunk = []
+                    current_length = 0
+
+                # 滑动窗口分割超长段落
+                sub_paras = slide_window_split(para, max_tokens, slide_step)
+                for sub_para in sub_paras:
+                    processed_chunks.append({
+                        "content": sub_para,
+                        "metadata": metadata.copy()
+                    })
+                continue
+
+            # 累积段落至当前块，超出长度则保存
+            if current_length + para_length > max_tokens:
+                processed_chunks.append({
+                    "content": '\n\n'.join(current_chunk),
+                    "metadata": metadata.copy()
+                })
+                current_chunk = [para]
+                current_length = para_length
             else:
-                if current_chunk["start_page"] is None:
-                    current_chunk["start_page"] = page_idx
-                current_chunk["end_page"] = page_idx
+                current_chunk.append(para)
+                current_length += para_length
 
-                if block["type"] == "text":
-                    current_chunk["content"].append(block["content"])
-                elif block["type"] == "image":
-                    current_chunk["images"].append({
-                        **block,
-                        "page_idx": page_idx
-                    })
-                elif block["type"] == "table":
-                    current_chunk["tables"].append({
-                        **block,
-                        "page_idx": page_idx
-                    })
+        # 添加当前章节剩余内容
+        if current_chunk:
+            processed_chunks.append({
+                "content": '\n\n'.join(current_chunk),
+                "metadata": metadata.copy()
+            })
 
-    # 添加最后一个块
-    if current_chunk["content"] or current_chunk["images"] or current_chunk["tables"]:
-        title_hash = hashlib.md5(current_chunk["title"].encode()).hexdigest() if current_chunk[
-            "title"] else hashlib.md5(str(current_chunk["start_page"]).encode()).hexdigest()
-        current_chunk["chunk_id"] = f"chunk_{title_hash}_{current_chunk['start_page']}"
-        full_content = "\n\n".join(current_chunk["content"])
-        current_chunk["para_simhashes"] = paragraph_simhash(full_content)
-        semantic_chunks.append(current_chunk)
-
-    return semantic_chunks
+    return processed_chunks
 
 
-# ===================== 新增：CLIP图文关联增强 =====================
-class CLIPImageTextAssociator:
-    """使用CLIP模型实现图文向量关联"""
+# ===================== 兜底检索工具（增强BM25融合） =====================
+class KeywordFallbackRetriever:
+    """兜底检索器：结合TF-IDF和BM25，增强关键词密集型问题召回"""
 
-    def __init__(self):
-        if not CLIP_AVAILABLE:
-            self.model = None
-            self.preprocess = None
-            logger.warning("CLIP未安装，无法使用图文关联功能。请安装：pip install torch clip-by-openai pillow")
+    def __init__(self, all_chunks: List[Dict[str, Any]] = None):
+        self.all_chunks = all_chunks or []
+        self.tfidf_vectorizer = None
+        self.chunk_vectors = None
+        self.bm25 = None
+        self.bm25_tokenized_corpus = []
+        self._build_tfidf_index()
+        self._build_bm25_index()
+        self._build_rule_map()
+
+    def _build_bm25_index(self) -> None:
+        """构建BM25索引，优化关键词检索"""
+        if not self.all_chunks:
+            print("⚠️ BM25索引构建条件不足（缺少数据）")
             return
 
         try:
-            # 加载CLIP模型
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-            self.model, self.preprocess = clip.load("ViT-B/32", device=self.device)
-            logger.info(f"CLIP模型加载成功，使用设备：{self.device}")
+            self.bm25_tokenized_corpus = [chunk["content"].split() for chunk in self.all_chunks]
+            self.bm25 = BM25Okapi(self.bm25_tokenized_corpus)
+            print(f"✅ BM25索引构建完成（{len(self.all_chunks)}个Chunk）")
         except Exception as e:
-            self.model = None
-            self.preprocess = None
-            logger.error(f"CLIP模型加载失败：{str(e)}")
+            print(f"⚠️ BM25索引构建失败：{str(e)}")
+            self.bm25 = None
 
-    def get_image_embedding(self, image_path):
-        """生成图像的CLIP向量"""
-        if not self.model or not os.path.exists(image_path):
-            return None
+    def _build_tfidf_index(self) -> None:
+        """构建TF-IDF索引，用于关键词相似度匹配"""
+        if not TFIDF_AVAILABLE or not self.all_chunks:
+            print("⚠️ TF-IDF索引构建条件不足（缺少依赖或数据）")
+            return
 
         try:
-            image = self.preprocess(Image.open(image_path)).unsqueeze(0).to(self.device)
-            with torch.no_grad():
-                image_features = self.model.encode_image(image)
-            return image_features.cpu().numpy().flatten().tolist()
+            chunk_texts = [chunk["content"] for chunk in self.all_chunks]
+            self.tfidf_vectorizer = TfidfVectorizer(
+                stop_words="english",
+                ngram_range=(1, 3),
+                max_features=10000
+            )
+            self.chunk_vectors = self.tfidf_vectorizer.fit_transform(chunk_texts)
+            print(f"✅ TF-IDF索引构建完成（{len(self.all_chunks)}个Chunk，{len(self.tfidf_vectorizer.vocabulary_)}个特征）")
         except Exception as e:
-            logger.error(f"生成图像向量失败：{str(e)}")
-            return None
+            print(f"⚠️ TF-IDF索引构建失败：{str(e)}")
+            self.tfidf_vectorizer = None
+            self.chunk_vectors = None
 
-    def get_text_embedding(self, text):
-        """生成文本的CLIP向量"""
-        if not self.model:
-            return None
+    def _build_rule_map(self) -> None:
+        """构建规则匹配映射（针对金融场景优化）"""
+        self.rule_map = {
+            "净利润": lambda c: "净利润" in c["content"] or "net profit" in c["content"].lower(),
+            "营业收入": lambda c: "营业收入" in c["content"] or "revenue" in c["content"].lower(),
+            "同比增长率": lambda c: "同比增长" in c["content"] or "year-on-year" in c["content"].lower(),
+            "资产减值损失": lambda c: "资产减值" in c["content"] or "impairment" in c["content"].lower(),
+            "毛利率": lambda c: "毛利率" in c["content"] or "gross margin" in c["content"].lower()
+        }
+        self.number_pattern = re.compile(r"\d+(\.\d+)?(%|元|万元|亿元|年|月|日)")
+        print("✅ 规则匹配映射构建完成")
 
-        try:
-            text = clip.tokenize([text]).to(self.device)
-            with torch.no_grad():
-                text_features = self.model.encode_text(text)
-            return text_features.cpu().numpy().flatten().tolist()
-        except Exception as e:
-            logger.error(f"生成文本向量失败：{str(e)}")
-            return None
+    def update_chunks(self, chunks: List[Dict[str, Any]]) -> None:
+        """更新Chunk数据并重建所有索引"""
+        self.all_chunks = chunks
+        self._build_tfidf_index()
+        self._build_bm25_index()
+        self._build_rule_map()
 
-    def associate_images_with_texts(self, semantic_chunks, image_dir):
-        """为语义块中的图像关联最相关的文本内容"""
-        if not self.model:
-            return semantic_chunks
+    def bm25_search(self, query: str, top_k: int = 20) -> List[Dict[str, Any]]:
+        """BM25关键词检索"""
+        if not self.bm25 or not self.all_chunks:
+            return []
 
-        # 处理每个语义块
-        for chunk in semantic_chunks:
-            # 生成块内文本的向量
-            chunk_text = chunk["title"] + "\n\n" + "\n\n".join(chunk["content"])
-            chunk_text_embedding = self.get_text_embedding(chunk_text)
+        tokenized_query = query.split()
+        scores = self.bm25.get_scores(tokenized_query)
+        top_indices = np.argsort(scores)[::-1][:top_k]
+        return [self.all_chunks[i] for i in top_indices]
 
-            # 处理块内每个图像
-            for image in chunk["images"]:
-                img_path = os.path.join(image_dir, image.get("img_path", ""))
-                image_embedding = self.get_image_embedding(img_path)
+    def retrieve(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+        """兜底检索执行：融合BM25+TF-IDF+规则"""
+        start_time = time.time()
+        if not self.all_chunks:
+            print("❌ 兜底检索无可用Chunk数据")
+            return []
 
-                if image_embedding and chunk_text_embedding:
-                    # 计算当前图像与块文本的相似度
-                    similarity = cosine_similarity(
-                        torch.tensor([image_embedding]),
-                        torch.tensor([chunk_text_embedding])
-                    ).item()
+        # 1. BM25检索（关键词密集型问题优先）
+        bm25_results = self.bm25_search(query, top_k=top_k * 2)
 
-                    image["clip_embedding"] = image_embedding
-                    image["text_embedding_similarity"] = round(similarity, 4)
+        # 2. 规则匹配（优先级最高）
+        rule_matched = []
+        for chunk in bm25_results:
+            match_score = 0
+            # 金融关键词规则匹配
+            for keyword, rule_func in self.rule_map.items():
+                if keyword in query and rule_func(chunk):
+                    match_score += 2
+            # 数字/日期匹配
+            query_numbers = set(self.number_pattern.findall(query))
+            chunk_numbers = set(self.number_pattern.findall(chunk["content"]))
+            if query_numbers & chunk_numbers:
+                match_score += 1.5
 
-        return semantic_chunks
+            if match_score > 0:
+                rule_matched.append((chunk, match_score))
+
+        # 3. TF-IDF关键词相似度匹配
+        tfidf_matched = []
+        if TFIDF_AVAILABLE and self.tfidf_vectorizer and self.chunk_vectors is not None:
+            try:
+                query_vector = self.tfidf_vectorizer.transform([query])
+                similarities = cosine_similarity(query_vector, self.chunk_vectors)[0]
+                tfidf_candidates = [
+                    (self.all_chunks[i], float(similarities[i]))
+                    for i in similarities.argsort()[::-1][:10]
+                    if self.all_chunks[i] not in [c for c, _ in rule_matched]
+                ]
+                tfidf_matched = [(c, s * 1.0) for c, s in tfidf_candidates]
+            except Exception as e:
+                print(f"⚠️ TF-IDF匹配失败：{str(e)}")
+
+        # 4. 综合排序
+        all_candidates = rule_matched + \
+                         [(c, 1.0) for c in bm25_results if c not in [rc[0] for rc in rule_matched]] + \
+                         tfidf_matched
+        if not all_candidates:
+            all_candidates = [(chunk, 0.1) for chunk in self.all_chunks[:top_k]]
+
+        # 按得分排序，相同得分优先短文本
+        all_candidates.sort(key=lambda x: (-x[1], len(x[0]["content"])))
+        final_results = [
+            {
+                **c,
+                "similarity": round(score, 4),
+                "retrieval_type": "keyword_fallback",
+                "model_version": "fallback"
+            }
+            for c, score in all_candidates[:top_k]
+        ]
+
+        print(f"✅ 兜底关键词检索完成（{len(final_results)}个结果），耗时：{round((time.time() - start_time) * 1000, 2)}ms")
+        return final_results
 
 
-# ===================== 新增：基于章节的逻辑页ID生成 =====================
-def generate_logical_page_id(middle_json):
+# ===================== 主流程：加载逻辑页并处理 =====================
+def main():
+    import json
+    from pathlib import Path
+
+    # 配置路径（根据实际项目结构调整）
+    input_base_dir = Path("_multi_rag/data_base_json_content")  # mineru解析结果目录
+    output_chunks_path = Path("_multi_rag/all_pdf_logical_chunks.json")  # 输出分块结果
+
+    # 1. 加载mineru生成的logical_pages
     logical_pages = []
-    for page in middle_json["pdf_info"]["pages"]:
-        # 提取章节标题（优先取一级标题，无则取所有标题的拼接）
-        headings = [b["content"] for b in page["blocks"] if b["type"] == "heading"]
-        if headings:
-            # 用标题内容的MD5哈希确保唯一性，避免章节名重复导致ID冲突
-            heading_hash = hashlib.md5(headings[0].encode()).hexdigest()
-            logical_id = f"chap_{heading_hash}_{page['page_idx']}"
-        else:
-            logical_id = f"no_heading_{page['page_idx']}"
+    for pdf_dir in input_base_dir.iterdir():
+        if not pdf_dir.is_dir():
+            continue
+        # 查找middle_json文件（包含logical_pages）
+        middle_json_path = pdf_dir / "auto" / f"{pdf_dir.name}_middle.json"
+        if not middle_json_path.exists():
+            print(f"⚠️ 未找到{pdf_dir.name}的middle_json文件，跳过")
+            continue
 
-        # 生成段落级Simhash特征
-        para_simhashes = paragraph_simhash(page["content"])
+        with open(middle_json_path, "r", encoding="utf-8") as f:
+            middle_json = json.load(f)
+            # 提取logical_pages并补充block_types信息
+            for page in middle_json.get("logical_pages", []):
+                # 从原始页面信息中获取block_types
+                page_idx = page["physical_page"]
+                for raw_page in middle_json["pdf_info"]["pages"]:
+                    if raw_page["page_idx"] == page_idx:
+                        page["block_types"] = [b["type"] for b in raw_page["blocks"]]
+                        break
+            logical_pages.extend(middle_json.get("logical_pages", []))
 
-        logical_pages.append({
-            "logical_id": logical_id,
-            "content": page["content"],
-            "physical_page": page["page_idx"],  # 保留物理页信息用于溯源
-            "para_simhashes": para_simhashes  # 新增段落Simhash特征
-        })
-    return logical_pages
+    if not logical_pages:
+        print("❌ 未加载到任何logical_pages数据")
+        return
 
+    # 2. 使用新分块函数处理
+    chunks = process_chunks_by_logical_structure(
+        logical_pages=logical_pages,
+        max_tokens=512,
+        slide_step=200
+    )
+    print(f"✅ 分块完成，共生成{len(chunks)}个Chunk")
 
-def do_parse(
-        output_dir,  # 解析结果输出目录
-        pdf_file_names: list[str],  # 待解析的 PDF 文件名列表
-        pdf_bytes_list: list[bytes],  # 待解析的 PDF 字节流列表
-        p_lang_list: list[str],  # 每个 PDF 的语言列表，默认为 'ch'（中文）
-        backend="pipeline",  # 解析 PDF 的后端，默认为 'pipeline'
-        parse_method="auto",  # 解析 PDF 的方法，默认为 'auto'
-        formula_enable=True,  # 是否启用公式解析
-        table_enable=True,  # 是否启用表格解析
-        server_url=None,  # 用于 vlm-sglang-client 后端的服务器地址
-        f_draw_layout_bbox=True,  # 是否绘制版面布局框
-        f_draw_span_bbox=True,  # 是否绘制文本块框
-        f_dump_md=True,  # 是否导出 markdown 文件
-        f_dump_middle_json=True,  # 是否导出中间 JSON 文件
-        f_dump_model_output=True,  # 是否导出模型输出文件
-        f_dump_orig_pdf=True,  # 是否导出原始 PDF 文件
-        f_dump_content_list=True,  # 是否导出内容列表文件
-        f_make_md_mode=MakeMode.MM_MD,  # 生成 markdown 内容的模式，默认为 MM_MD
-        start_page_id=0,  # 解析起始页码，默认为 0
-        end_page_id=None,  # 解析结束页码，默认为 None（解析到文档结尾）
-        f_enable_semantic_chunks=True,  # 新增：是否启用语义块生成
-        f_enable_clip_association=False,  # 新增：是否启用CLIP图文关联
-):
-    # 初始化CLIP图文关联器
-    clip_associator = CLIPImageTextAssociator() if f_enable_clip_association else None
+    # 3. 保存分块结果
+    output_chunks_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_chunks_path, "w", encoding="utf-8") as f:
+        json.dump(chunks, f, ensure_ascii=False, indent=2)
+    print(f"✅ 分块结果已保存至：{output_chunks_path}")
 
-    if backend == "pipeline":
-        for idx, pdf_bytes in enumerate(pdf_bytes_list):
-            new_pdf_bytes = convert_pdf_bytes_to_bytes_by_pypdfium2(pdf_bytes, start_page_id, end_page_id)
-            pdf_bytes_list[idx] = new_pdf_bytes
-
-        infer_results, all_image_lists, all_pdf_docs, lang_list, ocr_enabled_list = pipeline_doc_analyze(pdf_bytes_list,
-                                                                                                         p_lang_list,
-                                                                                                         parse_method=parse_method,
-                                                                                                         formula_enable=formula_enable,
-                                                                                                         table_enable=table_enable)
-
-        for idx, model_list in enumerate(infer_results):
-            model_json = copy.deepcopy(model_list)
-            pdf_file_name = pdf_file_names[idx]
-            local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, parse_method)
-            image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(local_md_dir)
-
-            images_list = all_image_lists[idx]
-            pdf_doc = all_pdf_docs[idx]
-            _lang = lang_list[idx]
-            _ocr_enable = ocr_enabled_list[idx]
-            middle_json = pipeline_result_to_middle_json(model_list, images_list, pdf_doc, image_writer, _lang,
-                                                         _ocr_enable, formula_enable)
-
-            # 生成逻辑页ID（含章节锚点和段落Simhash）
-            logical_pages = generate_logical_page_id(middle_json)
-            middle_json["logical_pages"] = logical_pages  # 将逻辑页信息注入中间JSON
-
-            # 新增：生成语义块
-            if f_enable_semantic_chunks:
-                semantic_chunks = generate_semantic_chunks(middle_json)
-
-                # 新增：应用CLIP图文关联
-                if f_enable_clip_association and clip_associator and CLIP_AVAILABLE:
-                    semantic_chunks = clip_associator.associate_images_with_texts(
-                        semantic_chunks,
-                        local_image_dir
-                    )
-
-                middle_json["semantic_chunks"] = semantic_chunks
-                logger.info(f"生成语义块完成：{len(semantic_chunks)}个块")
-
-            pdf_info = middle_json["pdf_info"]
-
-            pdf_bytes = pdf_bytes_list[idx]
-            if f_draw_layout_bbox:
-                draw_layout_bbox(pdf_info, pdf_bytes, local_md_dir, f"{pdf_file_name}_layout.pdf")
-
-            if f_draw_span_bbox:
-                draw_span_bbox(pdf_info, pdf_bytes, local_md_dir, f"{pdf_file_name}_span.pdf")
-
-            if f_dump_orig_pdf:
-                md_writer.write(
-                    f"{pdf_file_name}_origin.pdf",
-                    pdf_bytes,
-                )
-
-            if f_dump_md:
-                image_dir = str(os.path.basename(local_image_dir))
-                md_content_str = pipeline_union_make(pdf_info, f_make_md_mode, image_dir)
-                md_writer.write_string(
-                    f"{pdf_file_name}.md",
-                    md_content_str,
-                )
-
-            if f_dump_content_list:
-                image_dir = str(os.path.basename(local_image_dir))
-                content_list = pipeline_union_make(pdf_info, MakeMode.CONTENT_LIST, image_dir)
-                md_writer.write_string(
-                    f"{pdf_file_name}_content_list.json",
-                    json.dumps(content_list, ensure_ascii=False, indent=4),
-                )
-
-            if f_dump_middle_json:
-                md_writer.write_string(
-                    f"{pdf_file_name}_middle.json",
-                    json.dumps(middle_json, ensure_ascii=False, indent=4),
-                )
-
-            if f_dump_model_output:
-                md_writer.write_string(
-                    f"{pdf_file_name}_model.json",
-                    json.dumps(model_json, ensure_ascii=False, indent=4),
-                )
-
-            logger.info(f"local output dir is {local_md_dir}")
-    else:
-        if backend.startswith("vlm-"):
-            backend = backend[4:]
-
-        f_draw_span_bbox = False
-        parse_method = "vlm"
-        for idx, pdf_bytes in enumerate(pdf_bytes_list):
-            pdf_file_name = pdf_file_names[idx]
-            pdf_bytes = convert_pdf_bytes_to_bytes_by_pypdfium2(pdf_bytes, start_page_id, end_page_id)
-            local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, parse_method)
-            image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(local_md_dir)
-            middle_json, infer_result = vlm_doc_analyze(pdf_bytes, image_writer=image_writer, backend=backend,
-                                                        server_url=server_url)
-
-            # 生成逻辑页ID（含章节锚点和段落Simhash）
-            logical_pages = generate_logical_page_id(middle_json)
-            middle_json["logical_pages"] = logical_pages  # 将逻辑页信息注入中间JSON
-
-            # 新增：生成语义块
-            if f_enable_semantic_chunks:
-                semantic_chunks = generate_semantic_chunks(middle_json)
-
-                # 新增：应用CLIP图文关联
-                if f_enable_clip_association and clip_associator and CLIP_AVAILABLE:
-                    semantic_chunks = clip_associator.associate_images_with_texts(
-                        semantic_chunks,
-                        local_image_dir
-                    )
-
-                middle_json["semantic_chunks"] = semantic_chunks
-                logger.info(f"生成语义块完成：{len(semantic_chunks)}个块")
-
-            pdf_info = middle_json["pdf_info"]
-
-            if f_draw_layout_bbox:
-                draw_layout_bbox(pdf_info, pdf_bytes, local_md_dir, f"{pdf_file_name}_layout.pdf")
-
-            if f_draw_span_bbox:
-                draw_span_bbox(pdf_info, pdf_bytes, local_md_dir, f"{pdf_file_name}_span.pdf")
-
-            if f_dump_orig_pdf:
-                md_writer.write(
-                    f"{pdf_file_name}_origin.pdf",
-                    pdf_bytes,
-                )
-
-            if f_dump_md:
-                image_dir = str(os.path.basename(local_image_dir))
-                md_content_str = vlm_union_make(pdf_info, f_make_md_mode, image_dir)
-                md_writer.write_string(
-                    f"{pdf_file_name}.md",
-                    md_content_str,
-                )
-
-            if f_dump_content_list:
-                image_dir = str(os.path.basename(local_image_dir))
-                content_list = vlm_union_make(pdf_info, MakeMode.CONTENT_LIST, image_dir)
-                md_writer.write_string(
-                    f"{pdf_file_name}_content_list.json",
-                    json.dumps(content_list, ensure_ascii=False, indent=4),
-                )
-
-            if f_dump_middle_json:
-                md_writer.write_string(
-                    f"{pdf_file_name}_middle.json",
-                    json.dumps(middle_json, ensure_ascii=False, indent=4),
-                )
-
-            if f_dump_model_output:
-                model_output = ("\n" + "-" * 50 + "\n").join(infer_result)
-                md_writer.write_string(
-                    f"{pdf_file_name}_model_output.txt",
-                    model_output,
-                )
-
-            logger.info(f"local output dir is {local_md_dir}")
+    # 4. 初始化检索器
+    retriever = KeywordFallbackRetriever(chunks)
+    # 示例检索
+    test_query = "净利润同比增长率"
+    results = retriever.retrieve(test_query, top_k=3)
+    print(f"\n测试检索 '{test_query}' 结果：")
+    for i, res in enumerate(results, 1):
+        print(f"\n结果{i}（相似度：{res['similarity']}）：")
+        print(f"章节ID：{res['metadata']['logical_id']}")
+        print(f"内容预览：{res['content'][:200]}...")
 
 
-def parse_doc(
-        path_list: list[Path],
-        output_dir,
-        lang="ch",
-        backend="pipeline",
-        method="auto",
-        server_url=None,
-        start_page_id=0,
-        end_page_id=None,
-        enable_semantic_chunks=True,  # 新增参数
-        enable_clip_association=False  # 新增参数
-):
-    """
-        参数说明：
-        path_list: 待解析的文档路径列表，可以是 PDF 或图片文件。
-        output_dir: 解析结果输出目录。
-        lang: 语言选项，默认为 'ch'，可选值包括['ch', 'ch_server', 'ch_lite', 'en', 'korean', 'japan', 'chinese_cht', 'ta', 'te', 'ka']。
-            如果已知 PDF 内的语言可填写此项以提升 OCR 准确率，选填。
-            仅当 backend 设置为 "pipeline" 时生效。
-        backend: 解析 pdf 的后端：
-            pipeline: 通用。
-            vlm-transformers: 通用。
-            vlm-sglang-engine: 更快（engine）。
-            vlm-sglang-client: 更快（client）。
-            未指定 method 时默认使用 pipeline。
-        method: 解析 pdf 的方法：
-            auto: 根据文件类型自动判断。
-            txt: 使用文本提取方法。
-            ocr: 针对图片型 PDF 使用 OCR 方法。
-            未指定 method 时默认使用 'auto'。
-            仅当 backend 设置为 "pipeline" 时生效。
-        server_url: 当 backend 为 `sglang-client` 时需指定服务器地址，例如：`http://127.0.0.1:30000`
-        start_page_id: 解析起始页码，默认为 0
-        end_page_id: 解析结束页码，默认为 None（解析到文档结尾）
-        enable_semantic_chunks: 是否启用语义块生成，默认为True
-        enable_clip_association: 是否启用CLIP图文关联，默认为False
-    """
-    try:
-        file_name_list = []
-        pdf_bytes_list = []
-        lang_list = []
-        for path in path_list:
-            file_name = str(Path(path).stem)
-            pdf_bytes = read_fn(path)
-            file_name_list.append(file_name)
-            pdf_bytes_list.append(pdf_bytes)
-            lang_list.append(lang)
-        do_parse(
-            output_dir=output_dir,
-            pdf_file_names=file_name_list,
-            pdf_bytes_list=pdf_bytes_list,
-            p_lang_list=lang_list,
-            backend=backend,
-            parse_method=method,
-            server_url=server_url,
-            start_page_id=start_page_id,
-            end_page_id=end_page_id,
-            f_enable_semantic_chunks=enable_semantic_chunks,
-            f_enable_clip_association=enable_clip_association
-        )
-    except Exception as e:
-        logger.exception(e)
-
-
-if __name__ == '__main__':
-    # 确保simhash库已安装：pip install simhash
-    try:
-        from simhash import Simhash
-    except ImportError:
-        print("警告：未安装simhash库，请执行 'pip install simhash' 以启用段落级Simhash功能")
-
-    # 检查CLIP依赖
-    if CLIP_AVAILABLE:
-        print("CLIP库已安装，可使用图文关联功能")
-    else:
-        print("CLIP库未安装，如需使用图文关联功能，请执行 'pip install torch clip-by-openai pillow'")
-
-    # 参数设置
-    __dir__ = os.path.dirname(os.path.abspath(__file__))
-    pdf_files_dir = os.path.join(__dir__, "pdfs")
-    output_dir = os.path.join(__dir__, "output")
-    pdf_suffixes = [".pdf"]
-    image_suffixes = [".png", ".jpeg", ".jpg"]
-
-    doc_path_list = []
-    for doc_path in Path(pdf_files_dir).glob('*'):
-        if doc_path.suffix in pdf_suffixes + image_suffixes:
-            doc_path_list.append(doc_path)
-
-    """如果您由于网络问题无法下载模型，可以设置环境变量 MINERU_MODEL_SOURCE 为 modelscope，使用免代理仓库下载模型"""
-    # os.environ['MINERU_MODEL_SOURCE'] = "modelscope"
-
-    """如环境不支持 VLM，可使用 pipeline 模式"""
-    # 基础模式：仅生成语义块
-    parse_doc(doc_path_list, output_dir, backend="pipeline")
-
-    # 增强模式：生成语义块并启用CLIP图文关联（需要GPU支持）
-    # parse_doc(doc_path_list, output_dir, backend="pipeline", enable_clip_association=True)
-
-    """如需启用 VLM 模式，将 backend 改为 'vlm-xxx'"""
-    # parse_doc(doc_path_list, output_dir, backend="vlm-transformers")  # 通用。
-    # parse_doc(doc_path_list, output_dir, backend="vlm-sglang-engine")  # 更快（engine）。
-    # parse_doc(doc_path_list, output_dir, backend="vlm-sglang-client", server_url="http://127.0.0.1:30000")  # 更快（client）。
+if __name__ == "__main__":
+    main()

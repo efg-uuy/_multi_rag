@@ -10,6 +10,7 @@ from rank_bm25 import BM25Okapi  # 需确保安装rank-bm25
 # 检查TF-IDF依赖是否可用
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
+
     TFIDF_AVAILABLE = True
 except ImportError:
     TFIDF_AVAILABLE = False
@@ -32,16 +33,16 @@ def slide_window_split(text: str, max_tokens: int, slide_step: int) -> List[str]
 
 # ===================== 新增：基于章节逻辑的分块函数 =====================
 def process_chunks_by_logical_structure(
-    logical_pages: List[Dict[str, Any]],
-    max_tokens: int = 512,
-    slide_step: int = 200
+        logical_pages: List[Dict[str, Any]],
+        max_tokens: int = 512,
+        slide_step: int = 200
 ) -> List[Dict[str, Any]]:
     """
     基于文档逻辑结构（章节、段落）进行分块，保留表格和图表的完整性
     优先以logical_pages（章节）为单位，超长章节内部再细分
     """
     processed_chunks = []
-    
+
     for page in logical_pages:
         # 提取章节级内容与元数据
         content = page["content"].strip()
@@ -51,24 +52,24 @@ def process_chunks_by_logical_structure(
             "para_simhashes": page["para_simhashes"],  # 段落特征值
             "block_types": page.get("block_types", [])  # 块类型（表格/图片等）
         }
-        
+
         # 为特殊元素添加标记（提升检索精度）
         if "table" in metadata["block_types"]:
             content = f"[TABLE]\n{content}\n[/TABLE]"
         if "image" in metadata["block_types"] or "figure" in metadata["block_types"]:
             content = f"[CHART]\n{content}\n[/CHART]"
-        
+
         # 按空行分割段落（保留段落逻辑）
         paragraphs = re.split(r'\n\s*\n', content)
         paragraphs = [p.strip() for p in paragraphs if p.strip()]  # 过滤空段落
-        
+
         current_chunk = []
         current_length = 0
-        
+
         for para in paragraphs:
             para_tokens = para.split()
             para_length = len(para_tokens)
-            
+
             # 处理超长段落（单个段落超过最大长度）
             if para_length > max_tokens:
                 if current_chunk:
@@ -79,7 +80,7 @@ def process_chunks_by_logical_structure(
                     })
                     current_chunk = []
                     current_length = 0
-                
+
                 # 滑动窗口分割超长段落
                 sub_paras = slide_window_split(para, max_tokens, slide_step)
                 for sub_para in sub_paras:
@@ -88,7 +89,7 @@ def process_chunks_by_logical_structure(
                         "metadata": metadata.copy()
                     })
                 continue
-            
+
             # 累积段落至当前块，超出长度则保存
             if current_length + para_length > max_tokens:
                 processed_chunks.append({
@@ -100,14 +101,14 @@ def process_chunks_by_logical_structure(
             else:
                 current_chunk.append(para)
                 current_length += para_length
-        
+
         # 添加当前章节剩余内容
         if current_chunk:
             processed_chunks.append({
                 "content": '\n\n'.join(current_chunk),
                 "metadata": metadata.copy()
             })
-    
+
     return processed_chunks
 
 
@@ -182,7 +183,7 @@ class KeywordFallbackRetriever:
         """BM25关键词检索"""
         if not self.bm25 or not self.all_chunks:
             return []
-        
+
         tokenized_query = query.split()
         scores = self.bm25.get_scores(tokenized_query)
         top_indices = np.argsort(scores)[::-1][:top_k]
@@ -196,7 +197,7 @@ class KeywordFallbackRetriever:
             return []
 
         # 1. BM25检索（关键词密集型问题优先）
-        bm25_results = self.bm25_search(query, top_k=top_k*2)
+        bm25_results = self.bm25_search(query, top_k=top_k * 2)
 
         # 2. 规则匹配（优先级最高）
         rule_matched = []
@@ -232,8 +233,8 @@ class KeywordFallbackRetriever:
 
         # 4. 综合排序
         all_candidates = rule_matched + \
-                        [(c, 1.0) for c in bm25_results if c not in [rc[0] for rc in rule_matched]] + \
-                        tfidf_matched
+                         [(c, 1.0) for c in bm25_results if c not in [rc[0] for rc in rule_matched]] + \
+                         tfidf_matched
         if not all_candidates:
             all_candidates = [(chunk, 0.1) for chunk in self.all_chunks[:top_k]]
 
@@ -272,7 +273,7 @@ def main():
         if not middle_json_path.exists():
             print(f"⚠️ 未找到{pdf_dir.name}的middle_json文件，跳过")
             continue
-        
+
         with open(middle_json_path, "r", encoding="utf-8") as f:
             middle_json = json.load(f)
             # 提取logical_pages并补充block_types信息
